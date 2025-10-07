@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Daily Dose of Positivity</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1a1a1a; /* Deep Charcoal (Near Black) */
+            display: flex;
+            justify-content: center;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .message-card {
+            /* Magical gradient: Soft Violet to Electric Blue */
+            background: linear-gradient(135deg, #a29bfe 0%, #6c5ce7 100%); 
+            border: 1px solid #6c5ce7; /* Violet border */
+            /* Deep, soft shadow */
+            box-shadow: 0 15px 30px -10px rgba(108, 92, 231, 0.6), 0 4px 6px -2px rgba(0, 0, 0, 0.1);
+        }
+        .list-item:hover {
+            box-shadow: 0 4px 6px -1px rgba(255, 255, 255, 0.1);
+            transform: translateY(-1px);
+        }
+    </style>
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, doc, deleteDoc, setDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // IMPORTANT: These global variables are provided by the canvas environment.
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+        
+        // This is the ID of the person who first runs the app (the one we are talking to)
+        // This user gets special permissions to push messages to the public Vibe.
+        let CURATOR_ID = null; 
+
+        let publicVibeMessages = []; // Global array for public messages (for the Shuffle)
+        let myPrivateMessages = [];   // Global array for current user's messages (for the List)
+        let currentlyEditing = {}; // Tracks which message ID is in edit mode: { messageId: boolean }
+        let blockedVibeIds = new Set(); // Stores IDs of messages the current user has blocked
+
+        // Set log level to see Firebase console output
+        setLogLevel('Debug');
+
+        /**
+         * Initializes Firebase and authenticates the user.
+         */
+        async function initializeFirebase() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        
+                        // Set the current user as the Curator (for this environment only)
+                        if (!CURATOR_ID) {
+                            CURATOR_ID = userId;
+                        }
+
+                        // Update User ID and Curator status
+                        document.getElementById('user-id-display').innerHTML = `
+                            User ID: ${userId} 
+                            ${(userId === CURATOR_ID) ? '<span class="text-indigo-400 font-bold">(CURATOR)</span>' : ''}
+                        `;
+                        
+                        // Update Shared App ID
+                        document.getElementById('app-id-display').textContent = appId;
+                        
+                        console.log("Authenticated with user ID:", userId);
+                        
+                        setupListeners();
+                    } else {
+                        // Attempt to sign in using the provided custom token or anonymously
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase initialization or authentication failed:", error);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-600">Error: Could not connect to the database. Check console for details.</p>`;
+            }
+        }
+
+        /**
+         * Returns the reference to the PUBLIC VIBE collection.
+         */
+        function getVibeCollectionRef() {
+            if (!db) return null;
+            // Public path: /artifacts/{appId}/public/data/vibe_messages
+            return collection(db, 'artifacts', appId, 'public', 'data', 'vibe_messages');
+        }
+
+        /**
+         * Returns the reference to the user's PRIVATE message collection.
+         */
+        function getPrivateCollectionRef() {
+            if (!db || !userId) return null;
+            // Private path: /artifacts/{appId}/users/{userId}/my_private_messages
+            return collection(db, 'artifacts', appId, 'users', userId, 'my_private_messages');
+        }
+
+        /**
+         * Sets up real-time listeners for both public, private messages, and user settings.
+         */
+        function setupListeners() {
+            // Listener 1: Public Vibe Messages (for the Shuffle display)
+            const vibeRef = getVibeCollectionRef();
+            if (vibeRef) {
+                onSnapshot(vibeRef, (snapshot) => {
+                    publicVibeMessages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    displayRandomMessage(publicVibeMessages); 
+                    renderPublicVibeList(publicVibeMessages); // Added: Render the full list for the Curator
+                }, (error) => {
+                    console.error("Error listening to public messages:", error);
+                });
+            }
+
+            // Listener 2: User's Private Messages (for the Management list)
+            const privateRef = getPrivateCollectionRef();
+            if (privateRef) {
+                onSnapshot(privateRef, (snapshot) => {
+                    myPrivateMessages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    renderPrivateMessagesList(myPrivateMessages); 
+                }, (error) => {
+                    console.error("Error listening to private messages:", error);
+                });
+            }
+            
+            // Listener 3: User's Blocked Messages (Private Settings)
+            if (db && userId) {
+                const settingsDocRef = doc(db, 'artifacts', appId, 'users', userId, 'user_settings', 'vibe_settings');
+                onSnapshot(settingsDocRef, (docSnapshot) => {
+                    const data = docSnapshot.data();
+                    // Store blockedIds as a Set for efficient lookup
+                    const blockedArray = data?.blockedIds || [];
+                    blockedVibeIds = new Set(blockedArray); 
+                    
+                    // After updating the blocked list, refresh the main display
+                    displayRandomMessage(publicVibeMessages);
+                    
+                    // Update the blocked count display
+                    document.getElementById('blocked-count-display').textContent = blockedVibeIds.size;
+                }, (error) => {
+                    console.error("Error listening to user settings:", error);
+                });
+            }
+        }
+
+        /**
+         * Displays a single random message prominently at the top of the app, filtering blocked messages.
+         */
+        function displayRandomMessage(messages) {
+            const displayElement = document.getElementById('random-message-display');
+            const controlElement = document.getElementById('random-message-controls');
+
+            // 1. Filter out blocked messages
+            const availableMessages = messages.filter(msg => !blockedVibeIds.has(msg.id));
+            
+            let randomMessage = null;
+            let messageId = null;
+
+            if (availableMessages.length === 0) {
+                displayElement.innerHTML = `<p class="text-center text-xl font-medium text-slate-300">
+                    The Vibe Pool is empty, or you have blocked all available sayings! 
+                    <br><span class="text-sm">Try resetting your blocked list below.</span>
+                </p>`;
+                controlElement.innerHTML = ''; // Hide controls if nothing is available
+                return;
+            }
+            
+            const randomIndex = Math.floor(Math.random() * availableMessages.length);
+            randomMessage = availableMessages[randomIndex];
+            messageId = randomMessage.id;
+
+            displayElement.innerHTML = `
+                <div class="text-center">
+                    <p class="text-3xl font-extrabold text-white mb-4 tracking-tight leading-snug">
+                        ${randomMessage.text}
+                    </p>
+                    <p class="text-sm text-indigo-200 font-semibold uppercase opacity-90">
+                        Public Vibe Message
+                    </p>
+                </div>
+            `;
+            
+            // Update the controls area with the Shuffle and Block buttons
+            controlElement.innerHTML = `
+                <div class="flex flex-col sm:flex-row justify-center space-y-3 sm:space-y-0 sm:space-x-4">
+                    <button
+                        onclick="showNewMessage()"
+                        class="bg-yellow-400 text-slate-900 font-semibold py-2 px-6 rounded-full hover:bg-yellow-500 transition duration-150 shadow-xl shadow-yellow-400/50 active:scale-95 transform"
+                    >
+                        Shuffle Vibe
+                    </button>
+                    <button
+                        onclick="blockCurrentMessage('${messageId}')"
+                        class="bg-slate-500 text-white font-semibold py-2 px-6 rounded-full hover:bg-slate-600 transition duration-150 active:scale-95 transform text-sm sm:text-base"
+                        title="Block this message from appearing again for you."
+                    >
+                        Block Saying
+                    </button>
+                </div>
+            `;
+        }
+
+        /**
+         * Renders the list of messages added by the current user only (from their private collection).
+         */
+        function renderPrivateMessagesList(messages) {
+            const listElement = document.getElementById('message-list');
+            listElement.innerHTML = ''; // Clear existing list
+
+            if (messages.length === 0) {
+                listElement.innerHTML = '<p class="text-slate-400 text-center py-4">Your Private Scratchpad is empty. Add a message!</p>';
+                return;
+            }
+
+            messages.sort((a, b) => b.createdAt.toDate() - a.createdAt.toDate());
+
+            messages.forEach(message => {
+                const isPromoted = publicVibeMessages.some(vibeMsg => vibeMsg.text === message.text);
+                const isEditing = currentlyEditing[message.id]; // Check local edit state
+                
+                const item = document.createElement('div');
+                // Updated promoted background/border to Gold
+                item.className = 'list-item flex flex-col md:flex-row items-start md:items-center justify-between p-3 mb-2 bg-slate-700 rounded-lg shadow-md transition duration-150 border ' + (isPromoted ? 'border-yellow-400 bg-slate-600' : 'border-slate-700');
+                
+                // Updated badge colors
+                const statusBadge = isPromoted 
+                    ? `<span class="text-xs font-bold text-yellow-200 bg-yellow-700 rounded-full px-2 py-0.5 mr-2">PUBLIC VIBE</span>`
+                    : `<span class="text-xs font-medium text-slate-400 bg-slate-600 rounded-full px-2 py-0.5 mr-2">PRIVATE</span>`;
+
+                item.innerHTML = `
+                    <div class="flex-grow truncate mr-4 w-full md:w-auto mb-2 md:mb-0">
+                        ${statusBadge} 
+                        
+                        <!-- Static Text Display (Hidden when editing) -->
+                        <span id="text-display-${message.id}" class="text-slate-100 text-sm break-words ${isEditing ? 'hidden' : ''}">
+                            ${message.text}
+                        </span>
+                        
+                        <!-- Editable Input Field (Visible when editing) -->
+                        <textarea 
+                            id="edit-input-${message.id}" 
+                            class="w-full text-slate-900 text-sm p-2 rounded-lg bg-white border border-yellow-400 resize-none h-auto transition duration-150 ${isEditing ? '' : 'hidden'}"
+                            rows="2"
+                        >${message.text}</textarea>
+                    </div>
+
+                    <div class="flex space-x-2 flex-shrink-0 mt-2 md:mt-0">
+                        
+                        <!-- SAVE Button (Visible only when editing) -->
+                        <button
+                            id="save-btn-${message.id}"
+                            onclick="saveEdit('${message.id}')"
+                            class="bg-green-500 text-white text-xs font-semibold py-1 px-3 rounded-full hover:bg-green-600 transition duration-150 active:scale-95 transform ${isEditing ? '' : 'hidden'}"
+                            title="Save Changes"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check"><path d="M20 6 9 17l-5-5"/></svg>
+                        </button>
+
+                        <!-- EDIT Button (Visible only when NOT editing) -->
+                        <button
+                            id="edit-btn-${message.id}"
+                            onclick="toggleEdit('${message.id}')"
+                            class="bg-indigo-500 text-white text-xs font-semibold py-1 px-3 rounded-full hover:bg-indigo-600 transition duration-150 active:scale-95 transform ${isEditing ? 'hidden' : ''}"
+                            title="Edit Private Message"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-pencil"><path d="M17 3a2.85 2.85 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+                        </button>
+                        
+                        <!-- Promote Button (Hidden while editing) -->
+                        ${(userId === CURATOR_ID && !isPromoted && !isEditing) ? `
+                            <button
+                                onclick="promoteToVibe('${message.id}', '${message.text.replace(/'/g, "\\'")}')"
+                                class="bg-red-500 text-white text-xs font-semibold py-1 px-3 rounded-full hover:bg-red-600 transition duration-150 active:scale-95 transform"
+                                title="Add to the community Vibe pool"
+                            >
+                                Promote
+                            </button>` : ''}
+                        
+                        <!-- Delete Button (Hidden while editing) -->
+                        <button
+                            onclick="deletePrivateMessage('${message.id}')"
+                            class="text-red-400 hover:text-red-300 p-1 rounded-full transition duration-150 ${isEditing ? 'hidden' : ''}"
+                            title="Delete Private Message"
+                        >
+                            <!-- SVG trash icon -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-trash-2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+                        </button>
+                    </div>
+                `;
+                listElement.appendChild(item);
+            });
+            
+            // Auto-resize visible text areas immediately after rendering
+             setTimeout(() => {
+                document.querySelectorAll('textarea').forEach(textarea => {
+                    if (!textarea.classList.contains('hidden')) {
+                         textarea.style.height = 'auto'; 
+                         textarea.style.height = (textarea.scrollHeight) + 'px';
+                    }
+                });
+            }, 0);
+        }
+        
+        /**
+         * Renders the list of all PUBLIC VIBE messages (Curator's management view).
+         */
+        function renderPublicVibeList(messages) {
+            const containerElement = document.getElementById('public-vibe-container');
+            const listElement = document.getElementById('public-message-list');
+            
+            // Only show this section if the user is the Curator
+            if (userId !== CURATOR_ID) {
+                containerElement.classList.add('hidden');
+                return;
+            }
+            
+            containerElement.classList.remove('hidden');
+
+            listElement.innerHTML = ''; // Clear existing list
+            
+            // Update the message count header
+            const header = containerElement.querySelector('p.text-sm');
+            if (header) {
+                 header.innerHTML = `This list shows all **${messages.length}** sayings currently in rotation for everyone.`;
+            }
+
+
+            if (messages.length === 0) {
+                listElement.innerHTML = '<p class="text-slate-400 text-center py-4">The Public Vibe Pool is currently empty.</p>';
+                return;
+            }
+
+            // Sort by promotion date/time (newest first)
+            messages.sort((a, b) => {
+                // Handle cases where 'promotedAt' might be missing (for very old data or errors)
+                const dateA = b.promotedAt ? b.promotedAt.toDate() : new Date(0);
+                const dateB = a.promotedAt ? a.promotedAt.toDate() : new Date(0);
+                return dateA - dateB;
+            });
+
+            messages.forEach(message => {
+                const item = document.createElement('div');
+                item.className = 'list-item flex flex-col md:flex-row items-start md:items-center justify-between p-3 mb-2 bg-slate-700 rounded-lg shadow-md border border-yellow-400/50';
+                
+                // Truncate the ID for display purposes
+                const shortId = message.id.substring(0, 6);
+                
+                // Format the promotion date (or provide a fallback)
+                const promotedAtDate = message.promotedAt ? message.promotedAt.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ', ' + message.promotedAt.toDate().toLocaleDateString() : 'N/A';
+
+
+                item.innerHTML = `
+                    <div class="flex-grow truncate mr-4 w-full md:w-auto mb-2 md:mb-0">
+                        <span class="text-xs font-bold text-yellow-200 bg-yellow-700 rounded-full px-2 py-0.5 mr-2">VIBE ID: ${shortId}</span> 
+                        <span class="text-slate-100 text-sm break-words">
+                            ${message.text}
+                        </span>
+                        <p class="text-xs text-slate-400 mt-1">Promoted At: ${promotedAtDate}</p>
+                    </div>
+
+                    <div class="flex space-x-2 flex-shrink-0 mt-2 md:mt-0">
+                        <!-- Delete Public Button -->
+                        <button
+                            onclick="deletePublicMessage('${message.id}')"
+                            class="bg-red-700 text-white text-xs font-semibold py-1 px-3 rounded-full hover:bg-red-800 transition duration-150 active:scale-95 transform"
+                            title="Remove this message from the Public Vibe Pool"
+                        >
+                            Delete Public
+                        </button>
+                    </div>
+                `;
+                listElement.appendChild(item);
+            });
+        }
+
+
+        /**
+         * Adds a new message to the user's PRIVATE collection.
+         */
+        window.addMessage = async function() {
+            const input = document.getElementById('message-input');
+            const messageText = input.value.trim();
+
+            if (!isAuthReady) {
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Authentication is not ready. Please wait a moment.</p>`;
+                return;
+            }
+
+            if (messageText === "") {
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Please enter a message.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+                return;
+            }
+
+            try {
+                const privateRef = getPrivateCollectionRef();
+                await addDoc(privateRef, {
+                    text: messageText,
+                    addedBy: userId, 
+                    createdAt: new Date()
+                });
+                input.value = ''; // Clear input
+                document.getElementById('message-box').innerHTML = `<p class="text-green-400">Message saved to your Private Scratchpad!</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error adding message: ${e.message}</p>`;
+            }
+        }
+
+        /**
+         * Deletes a message from the user's PRIVATE collection.
+         */
+        window.deletePrivateMessage = async function(id) {
+            if (!isAuthReady) return;
+            try {
+                const privateRef = getPrivateCollectionRef();
+                const messageDocRef = doc(privateRef, id);
+                await deleteDoc(messageDocRef);
+                document.getElementById('message-box').innerHTML = `<p class="text-green-400">Message deleted from your private list.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+            } catch (e) {
+                console.error("Error deleting document: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error deleting message: ${e.message}</p>`;
+            }
+        }
+        
+        /**
+         * Deletes a message from the PUBLIC VIBE collection. Only for the Curator.
+         */
+        window.deletePublicMessage = async function(id) {
+            if (userId !== CURATOR_ID) {
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error: Only the Curator can delete public messages.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 4000);
+                return;
+            }
+            try {
+                const vibeRef = getVibeCollectionRef();
+                const messageDocRef = doc(vibeRef, id);
+                await deleteDoc(messageDocRef);
+                document.getElementById('message-box').innerHTML = `<p class="text-green-400">Public Vibe message deleted successfully!</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+            } catch (e) {
+                console.error("Error deleting public document: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error deleting public message: ${e.message}</p>`;
+            }
+        }
+
+        /**
+         * Updates a message in the user's PRIVATE collection.
+         */
+        window.updatePrivateMessage = async function(id, newText) {
+            if (!isAuthReady || newText.trim() === "") {
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Message cannot be empty.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+                return;
+            }
+
+            try {
+                const privateRef = getPrivateCollectionRef();
+                const messageDocRef = doc(privateRef, id);
+                
+                // Use setDoc to update the 'text' field
+                await setDoc(messageDocRef, { text: newText.trim() }, { merge: true });
+
+                // Exit edit mode on successful save
+                delete currentlyEditing[id]; 
+                
+                document.getElementById('message-box').innerHTML = `<p class="text-green-400">Message updated successfully!</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+                
+                // The onSnapshot listener will trigger renderPrivateMessagesList() automatically
+            } catch (e) {
+                console.error("Error updating document: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error updating message: ${e.message}</p>`;
+            }
+        }
+        
+        /**
+         * Toggles the editing state for a single message and triggers a re-render.
+         */
+        window.toggleEdit = function(id) {
+            if (currentlyEditing[id]) {
+                // Cancel editing
+                delete currentlyEditing[id];
+            } else {
+                // Start editing
+                currentlyEditing[id] = true;
+            }
+            
+            // Manually trigger a re-render to apply the new state classes
+            renderPrivateMessagesList(myPrivateMessages);
+        }
+
+        /**
+         * Handles reading the input field and calling the update function.
+         */
+        window.saveEdit = function(id) {
+            const inputElement = document.getElementById(`edit-input-${id}`);
+            const newText = inputElement ? inputElement.value : '';
+            
+            if (newText.trim()) {
+                window.updatePrivateMessage(id, newText);
+            } else {
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Cannot save an empty message.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+            }
+        }
+
+        /**
+         * Copies a message from the Curator's private list to the PUBLIC VIBE pool.
+         */
+        window.promoteToVibe = async function(id, text) {
+            if (userId !== CURATOR_ID) {
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error: Only the Curator can promote messages.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 4000);
+                return;
+            }
+            
+            try {
+                const vibeRef = getVibeCollectionRef();
+                // We use addDoc here to create a new, distinct document in the public collection.
+                await addDoc(vibeRef, {
+                    text: text,
+                    promotedBy: userId, 
+                    promotedAt: new Date()
+                });
+                document.getElementById('message-box').innerHTML = `<p class="text-green-400">Message promoted to the Public Vibe Pool!</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 3000);
+            } catch (e) {
+                console.error("Error promoting message: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error promoting message: ${e.message}</p>`;
+            }
+        }
+        
+        /**
+         * Blocks the currently displayed message by adding its ID to the user's private settings.
+         */
+        window.blockCurrentMessage = async function(messageId) {
+            if (!isAuthReady) return;
+            try {
+                const settingsDocRef = doc(db, 'artifacts', appId, 'users', userId, 'user_settings', 'vibe_settings');
+                
+                // Create a new array from the Set and add the new ID.
+                const newBlockedIds = [...blockedVibeIds, messageId];
+                
+                // Use setDoc with merge to update just the blockedIds field
+                await setDoc(settingsDocRef, { blockedIds: newBlockedIds }, { merge: true });
+                
+                document.getElementById('message-box').innerHTML = `<p class="text-green-400">Saying blocked! It won't appear on shuffle anymore.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 4000);
+                
+                // Force a shuffle to show a new, unblocked message
+                window.showNewMessage(); 
+            } catch (e) {
+                console.error("Error blocking message: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error blocking message: ${e.message}</p>`;
+            }
+        }
+        
+        /**
+         * Resets the user's blocked messages list.
+         */
+        window.resetBlockedMessages = async function() {
+             if (!isAuthReady) return;
+             if (blockedVibeIds.size === 0) return;
+
+             try {
+                const settingsDocRef = doc(db, 'artifacts', appId, 'users', userId, 'user_settings', 'vibe_settings');
+                
+                // Set the blockedIds array to an empty array
+                await setDoc(settingsDocRef, { blockedIds: [] }, { merge: true });
+                
+                document.getElementById('message-box').innerHTML = `<p class="text-green-400">Blocked list reset! All sayings are back in rotation.</p>`;
+                setTimeout(() => document.getElementById('message-box').innerHTML = '', 4000);
+                
+                // The listener will automatically rerender the display
+            } catch (e) {
+                console.error("Error resetting blocked messages: ", e);
+                document.getElementById('message-box').innerHTML = `<p class="text-red-400">Error resetting blocked messages: ${e.message}</p>`;
+            }
+        }
+
+
+        /**
+         * Manually re-displays a new random message when the button is clicked.
+         */
+        window.showNewMessage = function() {
+             displayRandomMessage(publicVibeMessages);
+        }
+
+        // Initialize Firebase on load
+        window.onload = initializeFirebase;
+    </script>
+</head>
+<body class="bg-[#1a1a1a]">
+    <div class="w-full max-w-2xl mx-auto rounded-2xl p-6 md:p-8">
+
+        <!-- Header -->
+        <h1 class="text-4xl font-extrabold text-white mb-8 text-center">✨ Daily Dose of Positivity ✨</h1>
+
+        <!-- User Info Display -->
+        <div id="user-info-container" class="mb-6 p-3 bg-slate-800 rounded-lg">
+            <div id="user-id-display" class="text-xs text-slate-400 truncate text-center mb-1">
+                Connecting...
+            </div>
+            <div class="text-xs text-indigo-300 font-mono text-center">
+                Shared App ID: <span id="app-id-display" class="font-bold text-yellow-400">Loading...</span>
+            </div>
+        </div>
+
+        <!-- Random Message Display Card (The main feature) -->
+        <div class="message-card p-6 md:p-10 rounded-3xl mb-8">
+            <h2 class="text-xl font-bold text-white mb-6 border-b border-indigo-300 pb-2 text-center">Today's Vibe (Public Pool)</h2>
+            <div id="random-message-display" class="min-h-[100px] flex items-center justify-center">
+                <p class="text-center text-xl font-medium text-slate-300">Loading messages...</p>
+            </div>
+            
+            <!-- Controls are now dynamically injected by displayRandomMessage -->
+            <div id="random-message-controls" class="mt-6 flex justify-center">
+                 <button
+                    onclick="showNewMessage()"
+                    class="bg-yellow-400 text-slate-900 font-semibold py-2 px-6 rounded-full hover:bg-yellow-500 transition duration-150 shadow-xl shadow-yellow-400/50 active:scale-95 transform"
+                >
+                    Shuffle Vibe
+                </button>
+            </div>
+            
+            <!-- Blocked Message Count and Reset Option -->
+            <div class="text-center mt-4">
+                <p class="text-xs text-indigo-200">
+                    Blocked by you: <span id="blocked-count-display">0</span> sayings 
+                    <button onclick="resetBlockedMessages()" class="text-yellow-300 hover:text-yellow-200 underline ml-2 font-medium">
+                        (Reset Blocked List)
+                    </button>
+                </p>
+            </div>
+
+        </div>
+
+
+        <!-- Input Section -->
+        <div class="bg-slate-800 p-6 rounded-2xl shadow-lg">
+            <h2 class="text-xl font-bold text-white mb-4">Add a New Message (Private Only)</h2>
+            <p class="text-sm text-slate-400 mb-3">All messages added here are **only visible to you**. The Curator must "Promote" messages to the Public Vibe.</p>
+            
+            <div class="flex space-x-3">
+                <textarea
+                    id="message-input"
+                    placeholder="Type a personal note or message here..."
+                    class="flex-grow p-3 border border-slate-600 rounded-xl focus:ring-yellow-400 focus:border-yellow-400 transition duration-150 resize-none h-20 bg-slate-700 text-white"
+                ></textarea>
+                <button
+                    onclick="addMessage()"
+                    class="bg-indigo-600 text-white font-semibold py-3 px-5 rounded-xl hover:bg-indigo-700 transition duration-150 shadow-lg shadow-indigo-500/50 active:scale-95 transform self-start"
+                >
+                    Save
+                </button>
+            </div>
+
+            <!-- Message Box for Feedback -->
+            <div id="message-box" class="h-6 mt-4 text-sm font-medium text-white"></div>
+
+            <!-- Message List -->
+            <div id="message-list-container" class="mt-6">
+                <h3 class="text-lg font-semibold text-slate-200 mb-3 border-b border-slate-600 pb-1">Your Private Scratchpad</h3>
+                <div id="message-list" class="space-y-2 max-h-60 overflow-y-auto pt-1">
+                    <!-- Messages will be inserted here by JavaScript -->
+                    <p class="text-slate-400 text-center py-4">Loading list...</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Public Vibe Management Section (Curator View) -->
+        <div id="public-vibe-container" class="bg-slate-800 p-6 rounded-2xl shadow-lg mt-6 hidden">
+            <h2 class="text-xl font-bold text-white mb-4">Public Vibe Pool Contents (Curator View)</h2>
+            <p class="text-sm text-slate-400 mb-3">This list shows all **0** sayings currently in rotation for everyone.</p>
+            <div id="public-message-list" class="space-y-2 max-h-60 overflow-y-auto pt-1">
+                <p class="text-slate-400 text-center py-4">Loading public list...</p>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
