@@ -1,2 +1,2 @@
 # daily-positivity-app
-A daily positive saying generator using Firestore
+A daily positive vibes generator
